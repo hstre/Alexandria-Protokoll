@@ -3,23 +3,28 @@
 openalex_ingest.py — OpenAlex → Alexandria Claims
 
 Fetches scientific papers from OpenAlex and creates protocol-compliant
-Alexandria claims — either rule-based (no LLM) or via an LLM backend.
+Alexandria claims in one of three modes:
 
-Extraction modes:
   rule-based (default)
-    1. [Author] CONTRIBUTES_TO [Paper]   — EMPIRICAL/suggestion
-    2. [Paper]  RELATES_TO [Concept]     — MODEL/suggestion (OpenAlex ML tags)
-    3. [Paper]  MENTIONS [Abstract]      — SPECULATIVE/hypothesis
+    Deterministic extraction from paper metadata — no LLM required.
 
-  LLM mode  (--llm-key KEY)
-    Uses the existing Builder from builder.py against any OpenAI-compatible
-    endpoint (default: DeepSeek).  Produces richer, semantically grounded
-    claims extracted from the full abstract.
+  single-LLM  (--llm-key KEY)
+    One Builder (Alpha) extracts claims via an OpenAI-compatible endpoint.
+    Default endpoint: DeepSeek (api.deepseek.com/v1).
+
+  dual-LLM    (--llm-key KEY  --llm-key-b KEY2)
+    Full DBA pipeline: Alpha + Beta extract independently, DiffEngine
+    detects disagreements, Adjudicator resolves them, then PatchChain.
+    Typical setup: Alpha=DeepSeek, Beta=OpenRouter (different model).
 
 Usage:
     python openalex_ingest.py "climate change" --max 10
-    python openalex_ingest.py "CRISPR" --max 5 --email you@example.com
-    python openalex_ingest.py "mRNA vaccines" --llm-key $DEEPSEEK_API_KEY
+    python openalex_ingest.py "mRNA vaccines" \\
+        --llm-key $DEEPSEEK_API_KEY
+    python openalex_ingest.py "mRNA vaccines" \\
+        --llm-key  $DEEPSEEK_API_KEY \\
+        --llm-key-b $OPENROUTER_API_KEY \\
+        --llm-model-b "meta-llama/llama-3.1-8b-instruct"
     python openalex_ingest.py "any topic" --demo
 """
 
@@ -50,6 +55,8 @@ _pkg_stub.__package__ = _PKG_NAME
 sys.modules[_PKG_NAME] = _pkg_stub
 
 def _load_submodule(name: str):
+    if f"{_PKG_NAME}.{name}" in sys.modules:
+        return sys.modules[f"{_PKG_NAME}.{name}"]
     spec = importlib.util.spec_from_file_location(
         f"{_PKG_NAME}.{name}",
         str(_PKG_PATH / f"{name}.py"),
@@ -60,20 +67,23 @@ def _load_submodule(name: str):
     spec.loader.exec_module(mod)
     return mod
 
+# Always needed
 _load_submodule("schema")
 _load_submodule("patch")
 
 from alexandria_core.schema import (   # noqa: E402
-    ClaimNode, Category, Modality, EpistemicStatus, BuilderOrigin,
+    ClaimNode, Category, Modality, BuilderOrigin,
 )
 from alexandria_core.patch import PatchChain, PatchEmitter  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-OPENALEX_BASE    = "https://api.openalex.org"
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL   = "deepseek-chat"
-RATE_LIMIT_S     = 0.12   # seconds between requests (polite pool)
+OPENALEX_BASE      = "https://api.openalex.org"
+DEEPSEEK_API_URL   = "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL     = "deepseek-chat"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL   = "mistralai/mistral-7b-instruct"
+RATE_LIMIT_S       = 0.12
 
 
 # ── OpenAlex helpers ───────────────────────────────────────────────────────────
@@ -84,10 +94,7 @@ def fetch_works(
     email:       str  = "",
     from_year:   int | None = None,
 ) -> list[dict]:
-    """
-    Fetch works from OpenAlex including concept tags.
-    Uses cursor pagination to handle large result sets.
-    """
+    """Fetch works from OpenAlex (with concepts). Cursor-paginated."""
     headers = {"User-Agent": f"AlexandriaIngest/0.1 ({email or 'anonymous'})"}
     params: dict = {
         "search":   query,
@@ -102,31 +109,27 @@ def fetch_works(
     if from_year:
         params["filter"] = f"publication_year:>={from_year}"
 
-    works:      list[dict] = []
-    cursor:     str        = "*"
-    last_req:   float      = 0.0
+    works: list[dict] = []
+    cursor  = "*"
+    last_req = 0.0
 
     with httpx.Client(base_url=OPENALEX_BASE, headers=headers, timeout=30.0) as client:
         while len(works) < max_results:
             params["cursor"] = cursor
-
             elapsed = time.time() - last_req
             if elapsed < RATE_LIMIT_S:
                 time.sleep(RATE_LIMIT_S - elapsed)
             last_req = time.time()
-
             try:
                 resp = client.get("/works", params=params)
                 resp.raise_for_status()
             except (httpx.ProxyError, httpx.ConnectError, httpx.HTTPStatusError) as e:
                 raise httpx.ConnectError(str(e)) from e
-
             data   = resp.json()
             batch  = data.get("results", [])
             if not batch:
                 break
             works.extend(batch)
-
             cursor = (data.get("meta") or {}).get("next_cursor")
             if not cursor:
                 break
@@ -135,10 +138,7 @@ def fetch_works(
 
 
 def demo_works(query: str, n: int = 5) -> list[dict]:
-    """
-    Generate synthetic OpenAlex-shaped work dicts for offline testing.
-    Covers all three claim types (authorship, concept, abstract).
-    """
+    """Generate synthetic OpenAlex-shaped work dicts for offline testing."""
     topics = query.split()[:3] or ["science"]
     base_abstract = (
         f"This study investigates {query} using a systematic approach. "
@@ -183,7 +183,6 @@ def demo_works(query: str, n: int = 5) -> list[dict]:
 
 
 def reconstruct_abstract(inverted_index: dict) -> str:
-    """Reconstruct readable abstract from OpenAlex inverted index format."""
     if not inverted_index:
         return ""
     positions: dict[int, str] = {}
@@ -199,12 +198,8 @@ _BASE_ASSUMPTIONS = ["SourceScope_OpenAlex", "AutoExtracted_RuleBasedIngest"]
 
 
 def work_to_claims(work: dict) -> list[ClaimNode]:
-    """
-    Derive protocol-compliant ClaimNodes from an OpenAlex work dict
-    using rule-based heuristics (no LLM).
-    """
+    """Derive ClaimNodes from OpenAlex metadata (no LLM)."""
     claims: list[ClaimNode] = []
-
     title       = (work.get("title") or "Untitled").strip()
     short_title = title[:100]
     openalex_id = work.get("id", "")
@@ -212,196 +207,197 @@ def work_to_claims(work: dict) -> list[ClaimNode]:
     doi         = work.get("doi", "")
     source_ref  = openalex_id or doi or title[:40]
     work_id_tag = openalex_id.rsplit("/", 1)[-1] if openalex_id else "unknown"
+    time_scope: dict = {"start_year": year, "end_year": year} if year else {}
+    venue = ((work.get("primary_location") or {}).get("source", {}).get("display_name", ""))
 
-    time_scope: dict = {}
-    if year:
-        time_scope = {"start_year": year, "end_year": year}
+    # 1. Author → Work
+    authors = [a.get("author", {}).get("display_name", "") for a in (work.get("authorships") or [])]
+    for author in [a for a in authors if a][:4]:
+        claims.append(ClaimNode.new(
+            subject=author, predicate="CONTRIBUTES_TO", object=short_title,
+            category=Category.EMPIRICAL, modality=Modality.SUGGESTION,
+            assumptions=[*_BASE_ASSUMPTIONS, "AuthorshipRecord_OpenAlexRegistry", f"WorkID_{work_id_tag}"],
+            source_refs=[source_ref], scope={"domain": "academic_authorship"},
+            time_scope=time_scope, builder_origin=BuilderOrigin.ALPHA,
+        ))
 
-    venue = (
-        (work.get("primary_location") or {})
-        .get("source", {})
-        .get("display_name", "")
-    )
-
-    # ── 1. Author CONTRIBUTES_TO Work ─────────────────────────────────────────
-    authors = [
-        a.get("author", {}).get("display_name", "")
-        for a in (work.get("authorships") or [])
-    ]
-    authors = [a for a in authors if a]
-
-    for author in authors[:4]:
-        # modality=SUGGESTION: rule-based extraction has no sigma value.
-        claim = ClaimNode.new(
-            subject   = author,
-            predicate = "CONTRIBUTES_TO",
-            object    = short_title,
-            category  = Category.EMPIRICAL,
-            modality  = Modality.SUGGESTION,
-            assumptions = [
-                *_BASE_ASSUMPTIONS,
-                "AuthorshipRecord_OpenAlexRegistry",
-                f"WorkID_{work_id_tag}",
-            ],
-            source_refs    = [source_ref],
-            scope          = {"domain": "academic_authorship"},
-            time_scope     = time_scope,
-            builder_origin = BuilderOrigin.ALPHA,
-        )
-        claims.append(claim)
-
-    # ── 2. Work RELATES_TO Concept (OpenAlex ML tagging) ─────────────────────
-    concepts = work.get("concepts") or []
-    for concept in concepts[:5]:
+    # 2. Work → Concept
+    for concept in (work.get("concepts") or [])[:5]:
         name  = (concept.get("display_name") or "").strip()
         score = float(concept.get("score") or 0.0)
         if not name or score < 0.3:
             continue
+        field_name = (concept.get("field") or {}).get("display_name", "") or "academic"
+        claims.append(ClaimNode.new(
+            subject=short_title, predicate="RELATES_TO", object=name,
+            category=Category.MODEL, modality=Modality.SUGGESTION,
+            assumptions=[*_BASE_ASSUMPTIONS, "OpenAlexConceptModel_ML", f"ConceptScore_{score:.2f}"],
+            source_refs=[source_ref], qualifiers={"concept_score": round(score, 4)},
+            scope={"domain": field_name}, time_scope=time_scope, builder_origin=BuilderOrigin.ALPHA,
+        ))
 
-        field_name = (
-            (concept.get("field") or {}).get("display_name", "")
-            or (concept.get("domain") or {}).get("display_name", "")
-            or "academic"
-        )
-
-        claim = ClaimNode.new(
-            subject   = short_title,
-            predicate = "RELATES_TO",
-            object    = name,
-            category  = Category.MODEL,
-            modality  = Modality.SUGGESTION,
-            assumptions = [
-                *_BASE_ASSUMPTIONS,
-                "OpenAlexConceptModel_ML",
-                f"ConceptScore_{score:.2f}",
-            ],
-            source_refs = [source_ref],
-            qualifiers  = {"concept_score": round(score, 4), "openalex_concept": True},
-            scope       = {"domain": field_name},
-            time_scope  = time_scope,
-            builder_origin = BuilderOrigin.ALPHA,
-        )
-        claims.append(claim)
-
-    # ── 3. Work MENTIONS first sentence of abstract ───────────────────────────
+    # 3. Work → Abstract snippet
     abstract_raw = work.get("abstract_inverted_index")
     if abstract_raw:
-        abstract   = reconstruct_abstract(abstract_raw)
-        first_sent = abstract.split(".")[0].strip()
+        first_sent = reconstruct_abstract(abstract_raw).split(".")[0].strip()
         if len(first_sent) > 30:
-            claim = ClaimNode.new(
-                subject   = short_title,
-                predicate = "MENTIONS",
-                object    = first_sent[:250],
-                category  = Category.SPECULATIVE,
-                modality  = Modality.HYPOTHESIS,
-                assumptions = [
-                    *_BASE_ASSUMPTIONS,
-                    "AbstractFirstSentenceHeuristic",
-                    "NotLLMValidated",
-                ],
-                source_refs    = [source_ref],
-                scope          = {"domain": venue or "academic"},
-                time_scope     = time_scope,
-                builder_origin = BuilderOrigin.ALPHA,
-            )
-            claims.append(claim)
+            claims.append(ClaimNode.new(
+                subject=short_title, predicate="MENTIONS", object=first_sent[:250],
+                category=Category.SPECULATIVE, modality=Modality.HYPOTHESIS,
+                assumptions=[*_BASE_ASSUMPTIONS, "AbstractFirstSentenceHeuristic", "NotLLMValidated"],
+                source_refs=[source_ref], scope={"domain": venue or "academic"},
+                time_scope=time_scope, builder_origin=BuilderOrigin.ALPHA,
+            ))
 
     return claims
 
 
-# ── LLM-based claim extractor ──────────────────────────────────────────────────
+# ── LLM extraction helpers ─────────────────────────────────────────────────────
 
-def llm_extract_claims(
-    works:    list[dict],
-    api_url:  str,
-    api_key:  str,
-    model:    str,
-    verbose:  bool = False,
-) -> tuple[list[ClaimNode], list[str]]:
-    """
-    Use an OpenAI-compatible LLM to extract structured claims from each work.
-
-    Delegates to the existing Builder from builder.py.
-    Works with DeepSeek, OpenAI, Ollama (OpenAI-compat mode), or LM Studio.
-
-    Returns (claims, errors).
-    """
-    # Lazy-load builder (imports httpx which must be installed)
-    if f"{_PKG_NAME}.builder" not in sys.modules:
-        _load_submodule("builder")
-
-    from alexandria_core.builder import Builder, BuilderConfig, WorkSource
-
+def _make_builder(api_url: str, api_key: str, model: str, origin: BuilderOrigin):
+    """Create a Builder instance for the given config."""
+    _load_submodule("builder")
+    from alexandria_core.builder import Builder, BuilderConfig
     config = BuilderConfig(
-        origin      = BuilderOrigin.ALPHA,
-        base_url    = api_url,
-        api_key     = api_key,
-        model       = model,
-        temperature = 0.2,
-        max_tokens  = 2048,
-        timeout     = 120.0,
+        origin=origin, base_url=api_url, api_key=api_key,
+        model=model, temperature=0.2, max_tokens=2048, timeout=120.0,
     )
-    builder = Builder(config)
+    return Builder(config)
 
+
+def single_llm_extract(
+    works:   list[dict],
+    api_url: str,
+    api_key: str,
+    model:   str,
+) -> tuple[list[ClaimNode], list[str]]:
+    """Extract claims with one Builder (Alpha)."""
+    _load_submodule("builder")
+    from alexandria_core.builder import WorkSource
+
+    builder = _make_builder(api_url, api_key, model, BuilderOrigin.ALPHA)
     all_claims: list[ClaimNode] = []
     errors:     list[str]       = []
 
     for work in works:
         title = (work.get("title") or "Untitled")[:60]
-        work_source = WorkSource.from_openalex(work)
         try:
-            claims = builder.process_work(work_source)
+            claims = builder.process_work(WorkSource.from_openalex(work))
             all_claims.extend(claims)
-            if verbose:
-                log.debug(f"LLM extracted {len(claims)} claims from {title!r}")
+            print(f"      [{len(claims):3d} claims]  {title} …")
+        except httpx.ProxyError as e:
+            msg = f"Proxy blocked {title!r}: {e}"
+            errors.append(msg); log.error(msg)
         except ConnectionError as e:
             msg = f"LLM connection error for {title!r}: {e}"
-            errors.append(msg)
-            log.error(msg)
-        except ValueError as e:
-            msg = f"LLM parse error for {title!r}: {e}"
-            errors.append(msg)
-            log.warning(msg)
-        except httpx.ProxyError as e:
-            msg = f"Network proxy blocked request for {title!r}: {e}"
-            errors.append(msg)
-            log.error(msg)
-        except Exception as e:
-            msg = f"Unexpected error for {title!r}: {type(e).__name__}: {e}"
-            errors.append(msg)
-            log.error(msg)
+            errors.append(msg); log.error(msg)
+        except (ValueError, Exception) as e:
+            msg = f"{type(e).__name__} for {title!r}: {e}"
+            errors.append(msg); log.warning(msg)
 
     return all_claims, errors
+
+
+def dual_llm_extract(
+    works:       list[dict],
+    cfg_alpha:   tuple[str, str, str],   # (url, key, model)
+    cfg_beta:    tuple[str, str, str],
+) -> tuple[list[ClaimNode], list[str], dict]:
+    """
+    Full DBA dual-builder: Alpha + Beta → DiffEngine → Adjudicator.
+    Returns (resolved_claims, errors, diff_summary).
+    """
+    _load_submodule("builder")
+    _load_submodule("diff")
+    _load_submodule("adjudication")
+    from alexandria_core.builder    import WorkSource
+    from alexandria_core.diff       import DiffEngine
+    from alexandria_core.adjudication import Adjudicator
+
+    builder_a = _make_builder(*cfg_alpha, BuilderOrigin.ALPHA)
+    builder_b = _make_builder(*cfg_beta,  BuilderOrigin.BETA)
+    diff_eng  = DiffEngine()
+
+    all_resolved: list[ClaimNode] = []
+    errors:       list[str]       = []
+    total_diffs   = 0
+
+    for work in works:
+        title  = (work.get("title") or "Untitled")[:60]
+        source = WorkSource.from_openalex(work)
+        source_ref = work.get("id") or work.get("doi") or title
+
+        # ── Alpha ──────────────────────────────────────────────────────────────
+        try:
+            claims_a = builder_a.process_work(source)
+        except Exception as e:
+            msg = f"Alpha error for {title!r}: {type(e).__name__}: {e}"
+            errors.append(msg); log.error(msg); claims_a = []
+
+        # ── Beta ───────────────────────────────────────────────────────────────
+        try:
+            claims_b = builder_b.process_work(source)
+        except Exception as e:
+            msg = f"Beta error for {title!r}: {type(e).__name__}: {e}"
+            errors.append(msg); log.error(msg); claims_b = []
+
+        # ── Diff ───────────────────────────────────────────────────────────────
+        diff_report = diff_eng.compare(claims_a, claims_b, source_ref)
+        total_diffs += len(diff_report.diffs)
+
+        # ── Adjudicate ─────────────────────────────────────────────────────────
+        adj = Adjudicator(claims_a, claims_b)
+        adj_result = adj.adjudicate(diff_report)
+        resolved = adj_result.resolved_claims
+
+        all_resolved.extend(resolved)
+        print(
+            f"      [{len(resolved):3d} resolved]  {title} …  "
+            f"(α={len(claims_a)} β={len(claims_b)} "
+            f"diffs={len(diff_report.diffs)} "
+            f"H={len(diff_report.high)} M={len(diff_report.medium)})"
+        )
+
+    diff_summary = {
+        "total_diffs":    total_diffs,
+        "works_processed": len(works),
+    }
+    return all_resolved, errors, diff_summary
 
 
 # ── Ingest pipeline ────────────────────────────────────────────────────────────
 
 def ingest(
-    query:       str,
-    max_results: int,
-    email:       str,
-    from_year:   int | None,
-    output:      str | None,
-    verbose:     bool,
-    demo:        bool = False,
-    llm_key:     str  = "",
-    llm_url:     str  = DEEPSEEK_API_URL,
-    llm_model:   str  = DEEPSEEK_MODEL,
+    query:        str,
+    max_results:  int,
+    email:        str,
+    from_year:    int | None,
+    output:       str | None,
+    verbose:      bool,
+    demo:         bool = False,
+    llm_key:      str  = "",
+    llm_url:      str  = DEEPSEEK_API_URL,
+    llm_model:    str  = DEEPSEEK_MODEL,
+    llm_key_b:    str  = "",
+    llm_url_b:    str  = OPENROUTER_API_URL,
+    llm_model_b:  str  = OPENROUTER_MODEL,
 ) -> int:
     logging.basicConfig(
-        level   = logging.DEBUG if verbose else logging.WARNING,
-        format  = "%(levelname)s %(name)s %(message)s",
+        level  = logging.DEBUG if verbose else logging.WARNING,
+        format = "%(levelname)s %(name)s %(message)s",
     )
 
-    use_llm = bool(llm_key)
-    mode    = "LLM" if use_llm else ("DEMO" if demo else "rule-based")
+    use_llm  = bool(llm_key)
+    use_dual = use_llm and bool(llm_key_b)
+    mode     = "dual-LLM" if use_dual else ("single-LLM" if use_llm else ("demo" if demo else "rule-based"))
 
     print(f"\n[Alexandria Ingest]  query={query!r}  max={max_results}  mode={mode}")
     if from_year:
         print(f"                     from_year={from_year}")
     if use_llm:
-        print(f"                     llm_url={llm_url}  model={llm_model}")
+        print(f"                     alpha: {llm_url}  model={llm_model}")
+    if use_dual:
+        print(f"                     beta:  {llm_url_b}  model={llm_model_b}")
 
     # ── Step 1: Fetch ──────────────────────────────────────────────────────────
     if demo:
@@ -413,41 +409,50 @@ def ingest(
         try:
             works = fetch_works(query, max_results, email, from_year)
         except httpx.HTTPStatusError as e:
-            print(f"      ERROR: OpenAlex returned HTTP {e.response.status_code}", file=sys.stderr)
+            print(f"      ERROR: OpenAlex HTTP {e.response.status_code}", file=sys.stderr)
             return 1
         except httpx.ConnectError:
             print("      ERROR: Cannot connect to api.openalex.org — check network", file=sys.stderr)
-            print("      TIP: Use --demo for offline testing with synthetic data", file=sys.stderr)
+            print("      TIP:   Use --demo for offline testing", file=sys.stderr)
             return 1
         print(f"      {len(works)} works retrieved.")
 
     # ── Step 2: Extract claims ─────────────────────────────────────────────────
-    print(f"\n[2/3] Extracting claims ({mode}) …")
-    llm_errors: list[str] = []
+    llm_errors:   list[str] = []
+    diff_summary: dict      = {}
 
-    if use_llm:
-        raw_claims, llm_errors = llm_extract_claims(
-            works, llm_url, llm_key, llm_model, verbose
+    if use_dual:
+        print(f"\n[2/3] Dual-LLM extraction (Alpha + Beta → Diff → Adjudicate) …")
+        raw_claims, llm_errors, diff_summary = dual_llm_extract(
+            works,
+            cfg_alpha = (llm_url,   llm_key,   llm_model),
+            cfg_beta  = (llm_url_b, llm_key_b, llm_model_b),
         )
-        if llm_errors:
-            for e in llm_errors:
-                print(f"      WARN: {e}", file=sys.stderr)
+    elif use_llm:
+        print(f"\n[2/3] Single-LLM extraction (Alpha only) …")
+        raw_claims, llm_errors = single_llm_extract(works, llm_url, llm_key, llm_model)
     else:
+        print(f"\n[2/3] Rule-based extraction …")
         raw_claims = []
         for work in works:
-            raw_claims.extend(work_to_claims(work))
+            wc = work_to_claims(work)
+            raw_claims.extend(wc)
+            print(f"      [{len(raw_claims):4d} claims]  {(work.get('title') or '')[:60]} …")
 
-    # ── Step 3: Feed into patch chain ─────────────────────────────────────────
-    print("\n[3/3] Building patch chain …")
-    chain:       PatchChain   = PatchChain()
-    emitter:     PatchEmitter = PatchEmitter(chain)
+    if llm_errors:
+        for e in llm_errors:
+            print(f"      WARN: {e}", file=sys.stderr)
+
+    # ── Step 3: Patch chain ────────────────────────────────────────────────────
+    print(f"\n[3/3] Building patch chain …")
+    chain        = PatchChain()
+    emitter      = PatchEmitter(chain)
     all_claims:  list[ClaimNode] = []
     skip_errors: list[str]       = []
 
     for claim in raw_claims:
-        title_hint = claim.subject[:50]
         try:
-            time.sleep(0.001)   # ensure strictly monotonic float timestamps
+            time.sleep(0.001)
             emitter.add(claim)
             all_claims.append(claim)
         except ValueError as e:
@@ -461,18 +466,17 @@ def ingest(
     ok, violations = chain.verify_integrity()
     integrity_str = "OK" if ok else f"FAILED ({len(violations)} violation(s))"
     print(f"      Chain: {chain.length} patches  |  integrity = {integrity_str}")
-    if violations:
-        for v in violations:
-            print(f"      !! {v}", file=sys.stderr)
+    for v in violations:
+        print(f"      !! {v}", file=sys.stderr)
 
-    # ── Build report ──────────────────────────────────────────────────────────
+    # ── Report ─────────────────────────────────────────────────────────────────
     category_counts:  dict[str, int] = {}
     predicate_counts: dict[str, int] = {}
     for c in all_claims:
         category_counts[c.category.value]  = category_counts.get(c.category.value, 0)  + 1
         predicate_counts[c.predicate]       = predicate_counts.get(c.predicate, 0)       + 1
 
-    report = {
+    report: dict = {
         "query":            query,
         "mode":             mode,
         "from_year":        from_year,
@@ -499,9 +503,10 @@ def ingest(
             for c in all_claims
         ],
     }
+    if diff_summary:
+        report["diff_summary"] = diff_summary
 
     report_json = json.dumps(report, indent=2, ensure_ascii=False)
-
     if output:
         Path(output).write_text(report_json, encoding="utf-8")
         print(f"\nReport saved → {output}")
@@ -519,41 +524,49 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Extraction modes:
-  default       Rule-based (no LLM, deterministic)
-  --llm-key KEY LLM-based via OpenAI-compatible endpoint (DeepSeek by default)
-  --demo        Offline test with synthetic data (no network)
+  default            Rule-based (deterministic, no LLM)
+  --llm-key KEY      Single-LLM via DeepSeek (or any OpenAI-compatible endpoint)
+  --llm-key-b KEY2   Dual-LLM: Alpha+Beta → Diff → Adjudicate → PatchChain
+  --demo             Offline test with synthetic data
 
 Examples:
   python openalex_ingest.py "climate change" --max 10
-  python openalex_ingest.py "CRISPR" --max 5 --email you@example.com
   python openalex_ingest.py "mRNA vaccines" --llm-key $DEEPSEEK_API_KEY --max 3
-  python openalex_ingest.py "mRNA vaccines" --llm-key $DEEPSEEK_API_KEY \\
-      --llm-url https://api.deepseek.com/v1 --llm-model deepseek-chat
+  python openalex_ingest.py "CRISPR" \\
+      --llm-key  $DEEPSEEK_API_KEY \\
+      --llm-key-b $OPENROUTER_API_KEY \\
+      --llm-model-b "meta-llama/llama-3.1-8b-instruct" --max 3
   python openalex_ingest.py "any topic" --demo
 """,
     )
     parser.add_argument("query",       help="OpenAlex full-text search query")
-    parser.add_argument("--max",       type=int,  default=10, dest="max_results",
+    parser.add_argument("--max",       type=int, default=10, dest="max_results",
                         help="Max papers to fetch (default: 10)")
     parser.add_argument("--email",     default="",
-                        help="Email for OpenAlex polite pool (faster rate limits)")
+                        help="Email for OpenAlex polite pool")
     parser.add_argument("--from-year", type=int, default=None, dest="from_year",
                         help="Filter: only papers from this year onwards")
     parser.add_argument("--output",    default=None,
                         help="Save JSON report to file (default: print to stdout)")
-    parser.add_argument("--verbose",   action="store_true",
-                        help="Enable debug logging")
+    parser.add_argument("--verbose",   action="store_true")
     parser.add_argument("--demo",      action="store_true",
-                        help="Use synthetic data instead of live OpenAlex API (offline test)")
+                        help="Use synthetic data (offline test)")
 
-    # LLM options
-    llm = parser.add_argument_group("LLM extraction (optional)")
-    llm.add_argument("--llm-key",   default=os.environ.get("DEEPSEEK_API_KEY", ""),
-                     help="API key for LLM backend (or set DEEPSEEK_API_KEY env var)")
-    llm.add_argument("--llm-url",   default=DEEPSEEK_API_URL,
-                     help=f"LLM base URL (default: {DEEPSEEK_API_URL})")
-    llm.add_argument("--llm-model", default=DEEPSEEK_MODEL,
-                     help=f"Model name (default: {DEEPSEEK_MODEL})")
+    alpha = parser.add_argument_group("Builder Alpha (primary LLM)")
+    alpha.add_argument("--llm-key",   default=os.environ.get("DEEPSEEK_API_KEY", ""),
+                       help="API key (or set DEEPSEEK_API_KEY env var)")
+    alpha.add_argument("--llm-url",   default=DEEPSEEK_API_URL,
+                       help=f"Base URL (default: {DEEPSEEK_API_URL})")
+    alpha.add_argument("--llm-model", default=DEEPSEEK_MODEL,
+                       help=f"Model (default: {DEEPSEEK_MODEL})")
+
+    beta = parser.add_argument_group("Builder Beta (enables dual-LLM mode)")
+    beta.add_argument("--llm-key-b",   default=os.environ.get("OPENROUTER_API_KEY", ""),
+                      help="API key for Beta (or set OPENROUTER_API_KEY env var)")
+    beta.add_argument("--llm-url-b",   default=OPENROUTER_API_URL,
+                      help=f"Base URL for Beta (default: {OPENROUTER_API_URL})")
+    beta.add_argument("--llm-model-b", default=OPENROUTER_MODEL,
+                      help=f"Model for Beta (default: {OPENROUTER_MODEL})")
 
     args = parser.parse_args()
     sys.exit(ingest(
@@ -567,6 +580,9 @@ Examples:
         llm_key     = args.llm_key,
         llm_url     = args.llm_url,
         llm_model   = args.llm_model,
+        llm_key_b   = args.llm_key_b,
+        llm_url_b   = args.llm_url_b,
+        llm_model_b = args.llm_model_b,
     ))
 
 
