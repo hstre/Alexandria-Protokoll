@@ -1,104 +1,135 @@
-# Alexandria-Protokoll
-Epistemic infrastructure for tamper-proof knowledge lineage — replacing citation authority with cryptographically auditable contribution chains.
+# Alexandria Protocol
 
-# Alexandria Protocol — Reference Implementation (v0.1)
+**Epistemic Infrastructure for Validated Knowledge Graphs**
 
-Minimal reference implementation of the **Alexandria Protocol**, a formally defined epistemic infrastructure for temporally anchored, manipulation-resistant knowledge management.
+> *A formally defined protocol that treats knowledge as a temporally indexed, structurally reconstructible process — not a static set of conclusions.*
 
-This code accompanies the working paper:
+**Hanns-Steffen Rentschler · 2026**
 
-> Rentschler, H.-S. (2026). *The Alexandria Protocol: A Formally Defined Epistemic Infrastructure for Auditable Knowledge Lineage*. SSRN Working Paper. 
-
------
+---
 
 ## What is Alexandria?
 
-Modern knowledge systems rely on authority, reputation, and citation chains to establish credibility. These mechanisms are opaque, retractable, and susceptible to manipulation.
+Alexandria is a protocol and reference implementation for building **epistemically auditable knowledge graphs**. It does not determine truth. Instead, it enforces structural admissibility through:
 
-Alexandria replaces this with **formally auditable epistemic lineage**: every knowledge claim is cryptographically anchored, every modification is traceable, and every dissent is preserved — permanently and tamper-detectably.
+- Explicit derivation paths and source traceability
+- Cryptographically anchored, append-only patch chains
+- Mandatory uncertainty disclosure for empirical claims
+- Dissent preservation via formal branch management (no silent winners)
+- A three-level audit gate (Patch / Claim / Graph)
 
-Alexandria does not determine truth. It enforces structural admissibility.
+The protocol is built on two independent knowledge sources: **OpenCyc** (ontology) and **OpenAlex** (scholarly literature). Two independent builders (Alpha, Beta) construct graphs in parallel; a Diff Engine and Adjudication Rulebook handle disagreements explicitly.
 
-**Three guarantees:**
+---
 
-- Reconstructibility: any epistemic state can be rebuilt from its patch chain
-- Tamper detectability: any modification of prior claims produces a hash mismatch
-- Dissent preservation: disagreement creates branches, never deletions
+## Current Version: v2.2
 
------
+### What changed in v2.2 (Sprint 1–3)
 
-## What this implementation demonstrates
+| # | Component | Change |
+|---|-----------|--------|
+| 1 | Norm levels | Explicit three-level separation: `[SHALL]` / `[DBA]` / `[HEURISTIC]` |
+| 2 | Adjudication C.3 | No silent Alpha default — unknown diff types → `UNRESOLVED_PENDING_RULE` |
+| 3 | BranchNode | First-class object with full lifecycle schema |
+| 4 | Seal D.5 | Maturity (Φ) is advisory only — never blocks a formally correct seal |
+| 5 | EpistemicIdentity | Claim + Lineage + Patch History as normative primary unit |
+| 6 | RelationsMatrix | Machine-checkable admissibility enforcement (Category × Predicate) |
+| 7 | ThreeLevelAudit | Patch / Claim / Graph audit levels cleanly separated |
+| 8 | Uncertainty rule | Precise 3-condition logic via `EpistemicIdentity.uncertainty_required()` |
+| 9 | MappingConfidence | Ontology mapping with explicit confidence tier |
+| 10 | DiffNode bias metadata | `adjudication_rule`, `winning_builder`, `bias_tag` |
+| 11 | SPL interface layer | Semantic Projection Layer — legal path from text to ClaimNode (WP2) |
+| 12 | Evaluation framework | Benchmark plan for Precision/Recall, calibration, mapping quality |
 
-- Typed epistemic nodes (`EMPIRICAL`, `MODEL`, `NORMATIVE`, `SPECULATIVE`)
-- Patch-DSL with operations `ADD`, `MODIFY`, `DEPRECATE`, `BRANCH`
-- Structural audit gate (schema, category purity, temporal monotonicity, uncertainty disclosure)
-- Append-only SHA-256 hash chain anchoring
-- Branch formation for dissent handling
-- Deterministic state reconstruction with integrity verification
-- Stability as validation persistence (not truth probability)
+---
 
-**No external dependencies.** Standard Python 3.8+.
-
------
-
-## Quickstart
-
-```bash
-python alexandria_core.py
-```
-
-Expected output:
-
-```json
-{
-  "branch": "b_temp_constraint",
-  "nodes": [
-    {
-      "id": "claim_001",
-      "category": "EMPIRICAL",
-      "deprecated": true,
-      "stability": 0.0869,
-      "sigma": 0.11,
-      "assumptions": ["Temp_below_0C", "Measurement_Calibrated_v1"],
-      "lineage_len": 3
-    }
-  ]
-}
-```
+## Repository Structure
 
 ```
-Reconstruction OK; tamper detection OK.
+alexandria_core/          # Reference implementation (Python)
+├── schema.py             # ClaimNode, BranchNode, EpistemicIdentity, all enums
+├── adjudication.py       # Rules C.1–C.9, BranchNode trigger
+├── audit.py              # AuditGate (5 blocks) + ThreeLevelAudit
+├── diff.py               # DiffNode (25 types), DiffEngine, BuilderBiasAnalyzer
+├── seal.py               # SealEngine, hard criteria D.1–D.4, D.6
+├── maturity.py           # M1–M5, Composite Φ, MaturityLevel
+├── patch.py              # PatchChain (SHA-256), PatchEmitter
+├── relations.py          # RelationsMatrix, AdmissibilityResult
+├── builder.py            # Builder Alpha/Beta, MappingConfidence
+├── sources.py            # OpenAlexClient, OpenCycLoader
+├── pipeline.py           # AlexandriaPipeline, PipelineResult
+├── db.py                 # Neo4j adapter, schema deployment
+├── spl.py                # Semantic Projection Layer (WP2)
+└── __init__.py           # Public API v1.1.0
 ```
 
-The demo runs a complete epistemic lifecycle: initial claim → branch with dissent → deprecation due to measurement artifact. Full history is preserved and reconstructible at every stage.
+---
 
------
+## Architecture
 
-## Deliberate simplifications
+```
+Layer 0   Raw Sources       OpenCyc + OpenAlex
+Layer 1   SemanticUnit      text segmentation
+Layer 2   SemanticProjection  concept alignment (WP2 / spl.py)
+Layer 3   ClaimCandidate    scored candidates (WP2 / spl.py)
+Layer 4   Canonical Claim   protocol boundary (ClaimCandidateConverter)
+Layer 5   Alexandria Protocol  Diff · Adjudication · Branch · Seal
+Layer 6   Epistemic Graph   Neo4j
+Layer 7   Synapse           cross-actor claim-graph similarity
+```
 
-This is a pedagogical reference, not production code. The following simplifications are intentional and documented in the paper (Appendix D):
+**Protocol invariant [SHALL]:** No text fragment may become a ClaimNode directly.  
+Only legal path: `text → SemanticUnit → SemanticProjection → ClaimCandidate → ClaimNode`
 
-|Simplification                       |Production requirement                                   |
-|-------------------------------------|---------------------------------------------------------|
-|Discrete stability approximation     |Continuous exponentially weighted integral (Section XI.4)|
-|Flat decay parameter                 |Domain-calibrated λ_k per knowledge element              |
-|Partial audit gate                   |Full five-block audit (Section X)                        |
-|No uncertainty propagation constraint|U(k₂) ≥ f(U(k₁)) per Section VII.6                       |
-|In-memory storage                    |Persistent, distributed backend                          |
+---
 
------
+## Norm Levels
 
-## Relation to the Dual-Layer Economy
+| Marker | Meaning |
+|--------|---------|
+| `[SHALL]` | Protocol invariant — never deviate; violation = FORMAL_ERROR |
+| `[DBA]` | Dual-Builder Architecture extension — protocol-compliant, explicitly declared |
+| `[HEURISTIC]` | Reference implementation default — replaceable |
+| `[ADVISORY]` | Recommendation — no formal status |
 
-Alexandria and the [Dual-Layer Economy](https://ssrn.com) [link to be added] operate on complementary levels:
+---
 
-- Alexandria: epistemic architecture — how knowledge is assessed and attributed
-- DLE: economic architecture — how value flows are kept stable within ecological limits
+## Hard Seal Criteria
 
-Knowledge validated through Alexandria can flow as a public good into the real economy layer of the DLE, with contribution attribution permanently preserved. This makes Alexandria a prerequisite for any future monetization of knowledge graphs that must exclude manipulation.
+| Criterion | Condition |
+|-----------|-----------|
+| D.1 | No open HIGH-severity DiffNodes |
+| D.2 | Every claim has ≥1 source_ref or evidence_ref |
+| D.3 | No claim with status=FORMAL_ERROR |
+| D.4 | SHA-256 patch chain integrity verified |
+| D.5 | *(Advisory only — Maturity Φ logged, never blocks seal)* |
+| D.6 | Every claim has non-empty assumptions[] |
 
------
+---
+
+## Dependencies
+
+```
+neo4j>=5.0.0
+httpx
+```
+
+No NLP backend required for the protocol layer. The SPL (spl.py) is designed for integration with sentence-transformers or similar embedding models.
+
+---
+
+## Related Papers (SSRN)
+
+- **Alexandria Protocol v2.2** — this repository  
+- **Working Paper 2: Semantic Projection Layer** — SPL interface specification (spl.py)  
+- **Dual-Layer Economy (DLE)** — SSRN 5885342  
+- **PES: Persistent Epistemic Supervisor** — forthcoming  
+
+---
 
 ## License
 
-MIT License. Use freely, cite honestly.
+Code: MIT  
+Protocol specification: CC BY 4.0
+
+© 2026 Hanns-Steffen Rentschler
