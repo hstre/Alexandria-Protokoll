@@ -1,0 +1,11 @@
+# Core
+httpx
+neo4j>=5.0.0
+
+# Dashboard (optional)
+streamlit
+plotly
+networkx
+
+# Development
+pytest

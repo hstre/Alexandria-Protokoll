@@ -1,0 +1,32 @@
+[project]
+name = "alexandria-protocol"
+version = "2.2.0"
+description = "Epistemic infrastructure for validated knowledge graphs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "neo4j>=5.0.0",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "streamlit",
+    "plotly",
+    "networkx",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+alexandria-ingest = "openalex_ingest:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alexandria_core*"]
