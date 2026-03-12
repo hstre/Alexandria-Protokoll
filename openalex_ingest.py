@@ -41,40 +41,10 @@ from pathlib import Path
 import httpx
 
 # ── Alexandria core imports ────────────────────────────────────────────────────
-# The package modules use relative imports (from .schema import …).
-# We register the package directory under a clean name so they resolve correctly.
-import importlib.util
-import types
-
-_PKG_PATH = Path(__file__).resolve().parent
-_PKG_NAME = "alexandria_core"
-
-_pkg_stub = types.ModuleType(_PKG_NAME)
-_pkg_stub.__path__    = [str(_PKG_PATH)]
-_pkg_stub.__package__ = _PKG_NAME
-sys.modules[_PKG_NAME] = _pkg_stub
-
-def _load_submodule(name: str):
-    if f"{_PKG_NAME}.{name}" in sys.modules:
-        return sys.modules[f"{_PKG_NAME}.{name}"]
-    spec = importlib.util.spec_from_file_location(
-        f"{_PKG_NAME}.{name}",
-        str(_PKG_PATH / f"{name}.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    mod.__package__ = _PKG_NAME
-    sys.modules[f"{_PKG_NAME}.{name}"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-# Always needed
-_load_submodule("schema")
-_load_submodule("patch")
-
-from alexandria_core.schema import (   # noqa: E402
+from alexandria_core.schema import (
     ClaimNode, Category, Modality, BuilderOrigin,
 )
-from alexandria_core.patch import PatchChain, PatchEmitter  # noqa: E402
+from alexandria_core.patch import PatchChain, PatchEmitter
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +226,6 @@ def work_to_claims(work: dict) -> list[ClaimNode]:
 
 def _make_builder(api_url: str, api_key: str, model: str, origin: BuilderOrigin):
     """Create a Builder instance for the given config."""
-    _load_submodule("builder")
     from alexandria_core.builder import Builder, BuilderConfig
     config = BuilderConfig(
         origin=origin, base_url=api_url, api_key=api_key,
@@ -272,7 +241,6 @@ def single_llm_extract(
     model:   str,
 ) -> tuple[list[ClaimNode], list[str]]:
     """Extract claims with one Builder (Alpha)."""
-    _load_submodule("builder")
     from alexandria_core.builder import WorkSource
 
     builder = _make_builder(api_url, api_key, model, BuilderOrigin.ALPHA)
@@ -307,9 +275,6 @@ def dual_llm_extract(
     Full DBA dual-builder: Alpha + Beta → DiffEngine → Adjudicator.
     Returns (resolved_claims, errors, diff_summary).
     """
-    _load_submodule("builder")
-    _load_submodule("diff")
-    _load_submodule("adjudication")
     from alexandria_core.builder    import WorkSource
     from alexandria_core.diff       import DiffEngine
     from alexandria_core.adjudication import Adjudicator
